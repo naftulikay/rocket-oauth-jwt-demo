@@ -1,3 +1,10 @@
+/*
+ * Callback handler for doing OAuth in-browser via JavaScript with no backend required, per se.
+ *
+ * This should be your callback in the HTML, see comments there. You'll receive a value with a field `credential`, and
+ * this will be your encoded JWT token. The expectation is that you will send this token to your server via a JavaScript
+ * HTTP request.
+ */
 function onLogin(resp) {
     var credentials = parseJwt(resp.credential);
     console.log(credentials);
