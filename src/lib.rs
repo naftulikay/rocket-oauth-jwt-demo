@@ -1,10 +1,15 @@
+use isahc::AsyncReadResponseExt;
 use jwt::{Token, Unverified};
+use openssl::pkey::{PKey, Public};
+use openssl::rsa::Rsa;
+use openssl::x509::X509;
 use rocket::form::Form;
 use rocket::fs::NamedFile;
 use rocket::http::CookieJar;
 use rocket::{get, post, routes, Build, Rocket};
 use rocket::{FromForm, State};
 use rocket_dyn_templates::Template;
+use serde::Deserialize;
 use std::collections::HashMap;
 use std::env;
 use std::path::{Path, PathBuf};
@@ -19,6 +24,27 @@ const OAUTH_CLIENT_ID_VAR: &'static str = "GOOGLE_OAUTH_CLIENT_ID";
 /// State for Rocket to maintain a read-only copy of the OAuth configuration.
 struct OAuthConfig {
     client_id: String,
+}
+
+/// Response from www.googleapis.com/oauth2/v1/certs containing key IDs to PEM-encoded certificates.
+#[derive(Deserialize)]
+struct GoogleCertsResponse(HashMap<String, String>);
+
+/// Key-store for Google JWT signing keys.
+struct JwtKeystore(HashMap<String, PKey<Public>>);
+
+impl TryFrom<GoogleCertsResponse> for JwtKeystore {
+    type Error = openssl::error::ErrorStack;
+
+    fn try_from(value: GoogleCertsResponse) -> Result<Self, Self::Error> {
+        let mut result = HashMap::with_capacity(value.0.len());
+
+        for (k, v) in value.0.into_iter() {
+            result.insert(k, X509::from_pem(v.as_bytes())?.public_key()?);
+        }
+
+        Ok(Self { 0: result })
+    }
 }
 
 /// Form request sent from Google to our service containing authorization data.
@@ -72,9 +98,11 @@ fn index(oauth: &State<OAuthConfig>) -> Template {
 #[post("/oauth/success", data = "<form>")]
 async fn oauth_success(
     oauth: &State<OAuthConfig>,
+    keystore: &State<JwtKeystore>,
     cookies: &CookieJar<'_>,
     form: Form<OAuthCredentials<'_>>,
 ) -> std::io::Result<Template> {
+    // verify that the request body's g_csrf_token field is equal to the g_csrf_token cookie
     if let Some(cookie) = cookies.get("g_csrf_token").map(|c| c.value()) {
         if !cookie.eq(form.g_csrf_token) {
             // FIXME return 400: csrf verification failed
@@ -83,9 +111,11 @@ async fn oauth_success(
         // FIXME return 400: did not receive csrf cookie
     }
 
+    // parse jwt header and claims without verification
     let token: Token<JwtHeader, JwtClaims, Unverified> =
         Token::parse_unverified(form.credential).unwrap();
 
+    // verify that jwt claims' `aud` is equal to the google oauth client id
     if let Some(actual_oauth_client_id) = token.claims().get("aud").map(|v| v.as_str()).flatten() {
         if !oauth.client_id.eq(actual_oauth_client_id) {
             // FIXME return 400: jwt `aud` field does not match our oauth client id
@@ -93,6 +123,19 @@ async fn oauth_success(
     } else {
         // FIXME return 400: jwt `aud` field not set
     }
+
+    // verify that jwt claims' `iss` is equal to /(https\:\/\/)?accounts\.google\.com/
+    if let Some(token_issuer) = token.claims().get("iss").map(|v| v.as_str()).flatten() {
+        if !token_issuer.eq("accounts.google.com")
+            && !token_issuer.eq("https://accounts.google.com")
+        {
+            // FIXME return 400: jwt `iss` is not accounts.google.com
+        }
+    } else {
+        // FIXME return 400: jwt `iss` field not set
+    }
+
+    // FIXME check that jwt `exp` is in the future and that `nbf` is now or before now
 
     Ok(Template::render(
         "login",
@@ -107,7 +150,8 @@ async fn static_files(file: PathBuf) -> Option<NamedFile> {
 }
 
 /// Start the Rocket server.
-pub fn start() -> Rocket<Build> {
+pub async fn start() -> Rocket<Build> {
+    // get the google oauth client id from the environment
     let oauth_client_id = env::var(OAUTH_CLIENT_ID_VAR).unwrap_or_else(|e| {
         eprintln!(
             "ERROR: Please set the Google OAuth client ID in the {} variable: {}",
@@ -116,10 +160,33 @@ pub fn start() -> Rocket<Build> {
         exit(1)
     });
 
+    // fetch the google jwt signing certificates
+    let certs: JwtKeystore = isahc::get_async("https://www.googleapis.com/oauth2/v1/certs")
+        .await
+        .unwrap_or_else(|e| {
+            eprintln!("ERROR: Unable to fetch certificates: {}", e);
+            exit(1)
+        })
+        .json::<GoogleCertsResponse>()
+        .await
+        .unwrap_or_else(|e| {
+            eprintln!(
+                "ERROR: Unable to deserialize certificates from JSON response: {}",
+                e
+            );
+            exit(1)
+        })
+        .try_into()
+        .unwrap_or_else(|e| {
+            eprintln!("ERROR: Unable to parse certificate: {}", e);
+            exit(1)
+        });
+
     rocket::build()
         .mount("/", routes![index, static_files, oauth_success])
         .manage(OAuthConfig {
             client_id: oauth_client_id,
         })
+        .manage(certs)
         .attach(Template::fairing())
 }

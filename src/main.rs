@@ -4,5 +4,5 @@ use rocket::error::Error;
 
 #[rocket::main]
 async fn main() -> Result<(), Error> {
-    start().launch().await
+    start().await.launch().await
 }
