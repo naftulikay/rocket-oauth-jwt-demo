@@ -1,16 +1,10 @@
-use isahc::AsyncReadResponseExt;
-use jwt::{AlgorithmType, PKeyWithDigest, Store, Token, Unverified, Verified, VerifyWithStore};
-use openssl::hash::MessageDigest;
-use openssl::pkey::{PKey, Public};
-use openssl::rsa::Rsa;
-use openssl::x509::X509;
+use jwt::{Token, Unverified};
 use rocket::form::Form;
 use rocket::fs::NamedFile;
 use rocket::http::CookieJar;
 use rocket::{get, post, routes, Build, Rocket};
 use rocket::{FromForm, State};
 use rocket_dyn_templates::Template;
-use serde::Deserialize;
 use std::collections::HashMap;
 use std::env;
 use std::path::{Path, PathBuf};
@@ -25,41 +19,6 @@ const OAUTH_CLIENT_ID_VAR: &'static str = "GOOGLE_OAUTH_CLIENT_ID";
 /// State for Rocket to maintain a read-only copy of the OAuth configuration.
 struct OAuthConfig {
     client_id: String,
-}
-
-/// Response from www.googleapis.com/oauth2/v1/certs containing key IDs to PEM-encoded certificates.
-#[derive(Deserialize)]
-struct GoogleCertsResponse(HashMap<String, String>);
-
-/// Key-store for Google JWT signing keys.
-struct JwtKeystore(HashMap<String, PKeyWithDigest<Public>>);
-
-impl TryFrom<GoogleCertsResponse> for JwtKeystore {
-    type Error = openssl::error::ErrorStack;
-
-    fn try_from(value: GoogleCertsResponse) -> Result<Self, Self::Error> {
-        let mut result = HashMap::with_capacity(value.0.len());
-
-        for (k, v) in value.0.into_iter() {
-            result.insert(
-                k,
-                PKeyWithDigest {
-                    key: X509::from_pem(v.as_bytes())?.public_key()?,
-                    digest: MessageDigest::sha256(),
-                },
-            );
-        }
-
-        Ok(Self { 0: result })
-    }
-}
-
-impl Store for JwtKeystore {
-    type Algorithm = PKeyWithDigest<Public>;
-
-    fn get(&self, key_id: &str) -> Option<&Self::Algorithm> {
-        self.0.get(key_id)
-    }
 }
 
 /// Form request sent from Google to our service containing authorization data.
@@ -113,7 +72,6 @@ fn index(oauth: &State<OAuthConfig>) -> Template {
 #[post("/oauth/success", data = "<form>")]
 async fn oauth_success(
     oauth: &State<OAuthConfig>,
-    keystore: &State<JwtKeystore>,
     cookies: &CookieJar<'_>,
     form: Form<OAuthCredentials<'_>>,
 ) -> std::io::Result<Template> {
@@ -175,33 +133,10 @@ pub async fn start() -> Rocket<Build> {
         exit(1)
     });
 
-    // fetch the google jwt signing certificates
-    let certs: JwtKeystore = isahc::get_async("https://www.googleapis.com/oauth2/v1/certs")
-        .await
-        .unwrap_or_else(|e| {
-            eprintln!("ERROR: Unable to fetch certificates: {}", e);
-            exit(1)
-        })
-        .json::<GoogleCertsResponse>()
-        .await
-        .unwrap_or_else(|e| {
-            eprintln!(
-                "ERROR: Unable to deserialize certificates from JSON response: {}",
-                e
-            );
-            exit(1)
-        })
-        .try_into()
-        .unwrap_or_else(|e| {
-            eprintln!("ERROR: Unable to parse certificate: {}", e);
-            exit(1)
-        });
-
     rocket::build()
         .mount("/", routes![index, static_files, oauth_success])
         .manage(OAuthConfig {
             client_id: oauth_client_id,
         })
-        .manage(certs)
         .attach(Template::fairing())
 }
