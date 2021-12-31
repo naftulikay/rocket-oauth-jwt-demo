@@ -937,6 +937,7 @@ dependencies = [
  "crypto-mac",
  "digest 0.9.0",
  "hmac",
+ "openssl",
  "serde",
  "serde_json",
  "sha2",

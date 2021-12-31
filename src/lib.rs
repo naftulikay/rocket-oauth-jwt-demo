@@ -1,5 +1,6 @@
 use isahc::AsyncReadResponseExt;
-use jwt::{Token, Unverified};
+use jwt::{AlgorithmType, PKeyWithDigest, Store, Token, Unverified, Verified, VerifyWithStore};
+use openssl::hash::MessageDigest;
 use openssl::pkey::{PKey, Public};
 use openssl::rsa::Rsa;
 use openssl::x509::X509;
@@ -31,7 +32,7 @@ struct OAuthConfig {
 struct GoogleCertsResponse(HashMap<String, String>);
 
 /// Key-store for Google JWT signing keys.
-struct JwtKeystore(HashMap<String, PKey<Public>>);
+struct JwtKeystore(HashMap<String, PKeyWithDigest<Public>>);
 
 impl TryFrom<GoogleCertsResponse> for JwtKeystore {
     type Error = openssl::error::ErrorStack;
@@ -40,10 +41,24 @@ impl TryFrom<GoogleCertsResponse> for JwtKeystore {
         let mut result = HashMap::with_capacity(value.0.len());
 
         for (k, v) in value.0.into_iter() {
-            result.insert(k, X509::from_pem(v.as_bytes())?.public_key()?);
+            result.insert(
+                k,
+                PKeyWithDigest {
+                    key: X509::from_pem(v.as_bytes())?.public_key()?,
+                    digest: MessageDigest::sha256(),
+                },
+            );
         }
 
         Ok(Self { 0: result })
+    }
+}
+
+impl Store for JwtKeystore {
+    type Algorithm = PKeyWithDigest<Public>;
+
+    fn get(&self, key_id: &str) -> Option<&Self::Algorithm> {
+        self.0.get(key_id)
     }
 }
 

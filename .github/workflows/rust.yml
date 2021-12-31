@@ -1,0 +1,59 @@
+---
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+    branches:
+      - main
+      - master
+  workflow_dispatch: {}
+
+env:
+  CACHE_VERSION: v1
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          target: x86_64-unknown-linux-musl # build static binaries
+      - uses: actions/cache@v2
+        with:
+          key: "${{ runner.os }}-rust-build-${{ env.CACHE_VERSION }}-${{ github.sha }}"
+          restore-keys: |
+            ${{ runner.os }}-rust-build-${{ env.CACHE_VERSION }}
+          path: |
+            ~/.cargo
+            ./target
+      - name: cargo build --release --target x86_64-unknown-linux-musl
+        uses: actions-rs/cargo@v1
+        with:
+          command: build
+          args: --release
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          target: x86_64-unknown-linux-musl # build static binaries
+      - uses: actions/cache@v2
+        with:
+          key: "${{ runner.os }}-rust-test-${{ env.CACHE_VERSION }}-${{ github.sha }}"
+          restore-keys: |
+            ${{ runner.os }}-rust-test-${{ env.CACHE_VERSION }}
+          path: |
+            ~/.cargo
+            ./target
+      # cargo test
+      - name: cargo test
+        uses: actions-rs/cargo@v1
+        with:
+          command: test
