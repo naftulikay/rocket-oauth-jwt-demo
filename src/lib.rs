@@ -1,16 +1,22 @@
-use jwt::{Token, Unverified};
+use isahc::AsyncReadResponseExt;
+use jwt::{
+    Error as JwtError, Header as JwtHeader, PKeyWithDigest, Store, Token, Verified, VerifyWithStore,
+};
+use openssl::hash::MessageDigest;
+use openssl::pkey::Public;
+use openssl::x509::X509;
 use rocket::form::Form;
 use rocket::fs::NamedFile;
 use rocket::http::CookieJar;
 use rocket::{get, post, routes, Build, Rocket};
 use rocket::{FromForm, State};
 use rocket_dyn_templates::Template;
+use serde::Deserialize;
 use std::collections::HashMap;
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::exit;
 
-type JwtHeader = serde_json::Value;
 type JwtClaims = serde_json::Value;
 
 /// The environment variable containing the OAuth client ID.
@@ -19,6 +25,41 @@ const OAUTH_CLIENT_ID_VAR: &'static str = "GOOGLE_OAUTH_CLIENT_ID";
 /// State for Rocket to maintain a read-only copy of the OAuth configuration.
 struct OAuthConfig {
     client_id: String,
+}
+
+/// Response from www.googleapis.com/oauth2/v1/certs containing key IDs to PEM-encoded certificates.
+#[derive(Deserialize)]
+struct GoogleCertsResponse(HashMap<String, String>);
+
+/// Key-store for Google JWT signing keys.
+struct JwtKeystore(HashMap<String, PKeyWithDigest<Public>>);
+
+impl TryFrom<GoogleCertsResponse> for JwtKeystore {
+    type Error = openssl::error::ErrorStack;
+
+    fn try_from(value: GoogleCertsResponse) -> Result<Self, Self::Error> {
+        let mut result = HashMap::with_capacity(value.0.len());
+
+        for (k, v) in value.0.into_iter() {
+            result.insert(
+                k,
+                PKeyWithDigest {
+                    key: X509::from_pem(v.as_bytes())?.public_key()?,
+                    digest: MessageDigest::sha256(),
+                },
+            );
+        }
+
+        Ok(Self { 0: result })
+    }
+}
+
+impl Store for JwtKeystore {
+    type Algorithm = PKeyWithDigest<Public>;
+
+    fn get(&self, key_id: &str) -> Option<&Self::Algorithm> {
+        self.0.get(key_id)
+    }
 }
 
 /// Form request sent from Google to our service containing authorization data.
@@ -72,6 +113,7 @@ fn index(oauth: &State<OAuthConfig>) -> Template {
 #[post("/oauth/success", data = "<form>")]
 async fn oauth_success(
     oauth: &State<OAuthConfig>,
+    keystore: &State<JwtKeystore>,
     cookies: &CookieJar<'_>,
     form: Form<OAuthCredentials<'_>>,
 ) -> std::io::Result<Template> {
@@ -84,9 +126,44 @@ async fn oauth_success(
         // FIXME return 400: did not receive csrf cookie
     }
 
-    // parse jwt header and claims without verification
-    let token: Token<JwtHeader, JwtClaims, Unverified> =
-        Token::parse_unverified(form.credential).unwrap();
+    // verify the received jwt token
+    let token: Result<Token<JwtHeader, JwtClaims, Verified>, jwt::Error> =
+        form.credential.verify_with_store(keystore.inner());
+
+    if let Err(err) = token {
+        eprintln!("ERROR: JWT error: {:?}", err);
+
+        match err {
+            JwtError::InvalidSignature => {
+                // FIXME return 400: received invalid signature
+                todo!()
+            }
+            JwtError::Base64(_)
+            | JwtError::Json(_)
+            | JwtError::NoHeaderComponent
+            | JwtError::NoClaimsComponent
+            | JwtError::NoSignatureComponent
+            | JwtError::NoKeyId
+            | JwtError::TooManyComponents
+            | JwtError::Utf8(_) => {
+                // FIXME return 400: we were sent something we couldn't use
+                todo!()
+            }
+            JwtError::AlgorithmMismatch(_, _)
+            | JwtError::OpenSsl(_)
+            | JwtError::NoKeyWithKeyId(_) => {
+                // FIXME return 500: something went bad on our side
+                todo!()
+            }
+            _ => {
+                unreachable!()
+            }
+        }
+    } else {
+        println!("INFO: Token verified!");
+    }
+
+    let token = token.unwrap();
 
     // verify that jwt claims' `aud` is equal to the google oauth client id
     if let Some(actual_oauth_client_id) = token.claims().get("aud").map(|v| v.as_str()).flatten() {
@@ -109,10 +186,12 @@ async fn oauth_success(
     }
 
     // FIXME check that jwt `exp` is in the future and that `nbf` is now or before now
+    // convert the headers into a serde_json::Value for template rendering
+    let headers_value = serde_json::to_value(token.header()).unwrap();
 
     Ok(Template::render(
         "login",
-        HashMap::from([("header", token.header()), ("claims", token.claims())]),
+        HashMap::from([("header", &headers_value), ("claims", token.claims())]),
     ))
 }
 
@@ -133,10 +212,33 @@ pub async fn start() -> Rocket<Build> {
         exit(1)
     });
 
+    // fetch the google jwt signing certificates
+    let certs: JwtKeystore = isahc::get_async("https://www.googleapis.com/oauth2/v1/certs")
+        .await
+        .unwrap_or_else(|e| {
+            eprintln!("ERROR: Unable to fetch certificates: {}", e);
+            exit(1)
+        })
+        .json::<GoogleCertsResponse>()
+        .await
+        .unwrap_or_else(|e| {
+            eprintln!(
+                "ERROR: Unable to deserialize certificates from JSON response: {}",
+                e
+            );
+            exit(1)
+        })
+        .try_into()
+        .unwrap_or_else(|e| {
+            eprintln!("ERROR: Unable to parse certificate: {}", e);
+            exit(1)
+        });
+
     rocket::build()
         .mount("/", routes![index, static_files, oauth_success])
         .manage(OAuthConfig {
             client_id: oauth_client_id,
         })
+        .manage(certs)
         .attach(Template::fairing())
 }
