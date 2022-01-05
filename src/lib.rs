@@ -1,73 +1,25 @@
-use isahc::AsyncReadResponseExt;
-use jwt::{
-    Error as JwtError, Header as JwtHeader, PKeyWithDigest, Store, Token, Verified, VerifyWithStore,
-};
-use openssl::hash::MessageDigest;
-use openssl::pkey::Public;
-use openssl::x509::X509;
+pub(crate) mod fairings;
+pub(crate) mod google;
+pub(crate) mod routes;
+
+use jwt::{Error as JwtError, Header as JwtHeader, Token, Verified, VerifyWithStore};
+use log::LevelFilter;
 use rocket::form::Form;
 use rocket::fs::NamedFile;
-use rocket::http::CookieJar;
-use rocket::{get, post, routes, Build, Rocket};
-use rocket::{FromForm, State};
+use rocket::http::{CookieJar, Status};
+use rocket::{catch, catchers, get, post, routes, Build, Rocket, State};
 use rocket_dyn_templates::Template;
-use serde::Deserialize;
 use std::collections::HashMap;
 use std::env;
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::process::exit;
+use time::format_description::well_known::Rfc3339;
+use time::OffsetDateTime;
+
+use crate::google::{GoogleJwtKeystore, OAuthConfig, OAuthCredentials, OAUTH_CLIENT_ID_VAR};
 
 type JwtClaims = serde_json::Value;
-
-/// The environment variable containing the OAuth client ID.
-const OAUTH_CLIENT_ID_VAR: &'static str = "GOOGLE_OAUTH_CLIENT_ID";
-
-/// State for Rocket to maintain a read-only copy of the OAuth configuration.
-struct OAuthConfig {
-    client_id: String,
-}
-
-/// Response from www.googleapis.com/oauth2/v1/certs containing key IDs to PEM-encoded certificates.
-#[derive(Deserialize)]
-struct GoogleCertsResponse(HashMap<String, String>);
-
-/// Key-store for Google JWT signing keys.
-struct JwtKeystore(HashMap<String, PKeyWithDigest<Public>>);
-
-impl TryFrom<GoogleCertsResponse> for JwtKeystore {
-    type Error = openssl::error::ErrorStack;
-
-    fn try_from(value: GoogleCertsResponse) -> Result<Self, Self::Error> {
-        let mut result = HashMap::with_capacity(value.0.len());
-
-        for (k, v) in value.0.into_iter() {
-            result.insert(
-                k,
-                PKeyWithDigest {
-                    key: X509::from_pem(v.as_bytes())?.public_key()?,
-                    digest: MessageDigest::sha256(),
-                },
-            );
-        }
-
-        Ok(Self { 0: result })
-    }
-}
-
-impl Store for JwtKeystore {
-    type Algorithm = PKeyWithDigest<Public>;
-
-    fn get(&self, key_id: &str) -> Option<&Self::Algorithm> {
-        self.0.get(key_id)
-    }
-}
-
-/// Form request sent from Google to our service containing authorization data.
-#[derive(FromForm)]
-struct OAuthCredentials<'r> {
-    credential: &'r str,
-    g_csrf_token: &'r str,
-}
 
 /// The root URL, which simply renders HTML including the Google sign-in button with the OAuth
 /// client id.
@@ -77,6 +29,16 @@ fn index(oauth: &State<OAuthConfig>) -> Template {
         "index",
         HashMap::from([("oauth_client_id", oauth.client_id.clone())]),
     )
+}
+
+#[catch(400)]
+fn oauth_bad_request() -> Template {
+    Template::render("errors/oauth/400", ())
+}
+
+#[catch(500)]
+fn oauth_server_error() -> Template {
+    Template::render("errors/oauth/500", ())
 }
 
 /// Receive OAuth POST with credentials from Google, return HTML.
@@ -113,30 +75,38 @@ fn index(oauth: &State<OAuthConfig>) -> Template {
 #[post("/oauth/success", data = "<form>")]
 async fn oauth_success(
     oauth: &State<OAuthConfig>,
-    keystore: &State<JwtKeystore>,
+    keystore: &State<GoogleJwtKeystore>,
     cookies: &CookieJar<'_>,
     form: Form<OAuthCredentials<'_>>,
-) -> std::io::Result<Template> {
+) -> Result<Template, Status> {
+    log::info!("Received login response from Google.");
+
     // verify that the request body's g_csrf_token field is equal to the g_csrf_token cookie
     if let Some(cookie) = cookies.get("g_csrf_token").map(|c| c.value()) {
         if !cookie.eq(form.g_csrf_token) {
-            // FIXME return 400: csrf verification failed
+            log::error!("CSRF token in the form does not match the CSRF token in the cookie.");
+            return Err(Status::BadRequest);
         }
     } else {
-        // FIXME return 400: did not receive csrf cookie
+        log::error!("Request did not include CSRF cookie.");
+        return Err(Status::BadRequest);
     }
 
     // verify the received jwt token
-    let token: Result<Token<JwtHeader, JwtClaims, Verified>, jwt::Error> =
-        form.credential.verify_with_store(keystore.inner());
+    let token: Result<Token<JwtHeader, JwtClaims, Verified>, jwt::Error> = {
+        // acquire and release the lock on the store; there should be N readers and one writer and writes will only
+        // occur once every 12-24 hours, so reader priority is important
+        form.credential
+            .verify_with_store(keystore.inner().inner().read().deref())
+    };
 
     if let Err(err) = token {
-        eprintln!("ERROR: JWT error: {:?}", err);
+        log::error!("JWT verification error: {:?}", err);
 
-        match err {
+        return match err {
             JwtError::InvalidSignature => {
-                // FIXME return 400: received invalid signature
-                todo!()
+                log::error!("Received JWT token with invalid signature.");
+                Err(Status::BadRequest)
             }
             JwtError::Base64(_)
             | JwtError::Json(_)
@@ -146,21 +116,23 @@ async fn oauth_success(
             | JwtError::NoKeyId
             | JwtError::TooManyComponents
             | JwtError::Utf8(_) => {
-                // FIXME return 400: we were sent something we couldn't use
-                todo!()
+                log::error!("Received a JWT token which was unusable.");
+                Err(Status::BadRequest)
             }
             JwtError::AlgorithmMismatch(_, _)
             | JwtError::OpenSsl(_)
             | JwtError::NoKeyWithKeyId(_) => {
-                // FIXME return 500: something went bad on our side
-                todo!()
+                log::error!("Failed to verify using the JWT token due to an internal error.");
+                Err(Status::InternalServerError)
             }
             _ => {
-                unreachable!()
+                // only other variants are rust crypto errors, i.e. not openssl
+                log::error!("Unknown JWT verification error, this should not be possible.");
+                Err(Status::InternalServerError)
             }
-        }
+        };
     } else {
-        println!("INFO: Token verified!");
+        log::info!("INFO: Token verified!");
     }
 
     let token = token.unwrap();
@@ -168,10 +140,19 @@ async fn oauth_success(
     // verify that jwt claims' `aud` is equal to the google oauth client id
     if let Some(actual_oauth_client_id) = token.claims().get("aud").map(|v| v.as_str()).flatten() {
         if !oauth.client_id.eq(actual_oauth_client_id) {
-            // FIXME return 400: jwt `aud` field does not match our oauth client id
+            log::error!(
+                "JWT token's aud field does not match our client id, found {}, expected {}",
+                actual_oauth_client_id,
+                oauth.client_id
+            );
+            return Err(Status::BadRequest);
         }
     } else {
-        // FIXME return 400: jwt `aud` field not set
+        log::error!(
+            "JWT token's aud field is not present; it must be present and set to {}",
+            oauth.client_id
+        );
+        return Err(Status::BadRequest);
     }
 
     // verify that jwt claims' `iss` is equal to /(https\:\/\/)?accounts\.google\.com/
@@ -179,13 +160,76 @@ async fn oauth_success(
         if !token_issuer.eq("accounts.google.com")
             && !token_issuer.eq("https://accounts.google.com")
         {
-            // FIXME return 400: jwt `iss` is not accounts.google.com
+            log::error!(
+                "JWT token issuer is not accounts.google.com: {}",
+                token_issuer
+            );
+            return Err(Status::BadRequest);
         }
     } else {
-        // FIXME return 400: jwt `iss` field not set
+        log::error!(
+            "JWT token issuer is not set; it must be present and set to accounts.google.com"
+        );
+        return Err(Status::BadRequest);
     }
 
-    // FIXME check that jwt `exp` is in the future and that `nbf` is now or before now
+    // check time constraints on the token, that exp is in the future and nbf is in the past
+    let now = OffsetDateTime::now_utc();
+
+    // check that the jwt field `exp` is in the future
+    if let Some(Ok(exp)) = token
+        .claims()
+        .get("exp")
+        .map(|v| v.as_u64())
+        .flatten()
+        .map(|n| {
+            OffsetDateTime::from_unix_timestamp(n.try_into().unwrap_or(i64::MAX)).map_err(|e| {
+                log::error!(
+                    "Unable to parse date from Unix timestamp in JWT's 'exp' field: {}",
+                    e
+                );
+                e
+            })
+        })
+    {
+        if exp <= now {
+            log::error!(
+                "Received an expired JWT token, expired at {}",
+                exp.format(&Rfc3339).unwrap()
+            );
+            return Err(Status::BadRequest);
+        }
+    } else {
+        log::error!("JWT token did not contain a usable expiration date.");
+        return Err(Status::BadRequest);
+    }
+
+    // check that the jwt field `nbf` is in the past
+    if let Some(Ok(nbf)) = token
+        .claims()
+        .get("nbf")
+        .map(|v| v.as_u64())
+        .flatten()
+        .map(|n| {
+            OffsetDateTime::from_unix_timestamp(n.try_into().unwrap_or(i64::MAX)).map_err(|e| {
+                log::error!(
+                    "Unable to parse date from Unix timestamp in JWT's 'exp' field: {}",
+                    e
+                );
+                e
+            })
+        })
+    {
+        if nbf > now {
+            log::error!(
+                "Received a JWT token which is not valid yet, validity starts at: {}",
+                nbf.format(&Rfc3339).unwrap()
+            );
+            // this is an internal server error because it's likely that our clock is off
+            return Err(Status::InternalServerError);
+        }
+    }
+
     // convert the headers into a serde_json::Value for template rendering
     let headers_value = serde_json::to_value(token.header()).unwrap();
 
@@ -203,36 +247,27 @@ async fn static_files(file: PathBuf) -> Option<NamedFile> {
 
 /// Start the Rocket server.
 pub async fn start() -> Rocket<Build> {
+    env_logger::builder()
+        .filter_level(LevelFilter::Error)
+        .filter_module("rkt_oauth", LevelFilter::Debug)
+        .filter_module("rocket", LevelFilter::Debug)
+        .init();
+
     // get the google oauth client id from the environment
     let oauth_client_id = env::var(OAUTH_CLIENT_ID_VAR).unwrap_or_else(|e| {
-        eprintln!(
-            "ERROR: Please set the Google OAuth client ID in the {} variable: {}",
-            OAUTH_CLIENT_ID_VAR, e
+        log::error!(
+            "Please set the Google OAuth client ID in the {} variable: {}",
+            OAUTH_CLIENT_ID_VAR,
+            e
         );
         exit(1)
     });
 
     // fetch the google jwt signing certificates
-    let certs: JwtKeystore = isahc::get_async("https://www.googleapis.com/oauth2/v1/certs")
-        .await
-        .unwrap_or_else(|e| {
-            eprintln!("ERROR: Unable to fetch certificates: {}", e);
-            exit(1)
-        })
-        .json::<GoogleCertsResponse>()
-        .await
-        .unwrap_or_else(|e| {
-            eprintln!(
-                "ERROR: Unable to deserialize certificates from JSON response: {}",
-                e
-            );
-            exit(1)
-        })
-        .try_into()
-        .unwrap_or_else(|e| {
-            eprintln!("ERROR: Unable to parse certificate: {}", e);
-            exit(1)
-        });
+    let certs = GoogleJwtKeystore::init().await.unwrap_or_else(|e| {
+        log::error!("Unable to initialize the keystore: {}", e);
+        exit(1)
+    });
 
     rocket::build()
         .mount("/", routes![index, static_files, oauth_success])
@@ -240,5 +275,9 @@ pub async fn start() -> Rocket<Build> {
             client_id: oauth_client_id,
         })
         .manage(certs)
+        .register(
+            "/oauth/success",
+            catchers![oauth_bad_request, oauth_server_error],
+        )
         .attach(Template::fairing())
 }
