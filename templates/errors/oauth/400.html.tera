@@ -1,0 +1,10 @@
+{% extends "base" %}
+{% block title %}Bad Request Error (400){% endblock %}
+{% block content %}
+    <h1>Bad Request</h1>
+    <p>Google's OAuth service sent us a bad request.</p>
+    {% if error %}
+        <h3>Error Message</h3>
+        <pre><code class="language-plain">{{ error | safe }}</code></pre>
+    {% endif %}
+{% endblock %}
