@@ -5,10 +5,17 @@ edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[[bin]]
+path = "src/examples/gen-key.rs"
+name = "gen-key"
+
 [dependencies]
 anyhow = "1"
+base64 = "0.13"
 env_logger = "0.9"
+hex = "0.4"
 isahc = { version = "1", features = ["json"] }
+josekit = "0.7"
 jwt = { version = "0.15", features = ["openssl"] }
 lazy_static = "1"
 left-right = "0.11"
@@ -16,6 +23,7 @@ log = "0.4"
 openssl = "0.10"
 parking_lot = "0.11"
 regex = "1"
+ring = "0.16"
 rocket = "0.5.0-rc.1"
 rocket_dyn_templates = { version = "0.1.0-rc.1", features = ["tera"] }
 serde = { version = "1", features = ["derive"] }
