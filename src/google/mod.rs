@@ -1,7 +1,7 @@
 #[cfg(test)]
 mod tests;
 
-use anyhow::Error;
+use anyhow::{anyhow, Error};
 use isahc::AsyncReadResponseExt;
 use jwt::{PKeyWithDigest, Store};
 use lazy_static::lazy_static;
@@ -10,10 +10,11 @@ use openssl::pkey::Public;
 use openssl::x509::X509;
 use parking_lot::RwLock;
 use regex::Regex;
-use rocket::tokio;
-use rocket::FromForm;
+use rocket::http::uri::{Authority, Uri};
+use rocket::{tokio, FromForm};
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::env;
 use std::ops::Sub;
 use std::sync::Arc;
 use time::format_description::FormatItem;
@@ -38,11 +39,52 @@ static EXPIRES_TIME_FORMAT: &'static [FormatItem<'static>] = format_description!
 );
 
 /// The environment variable containing the OAuth client ID.
-pub const OAUTH_CLIENT_ID_VAR: &'static str = "GOOGLE_OAUTH_CLIENT_ID";
+const OAUTH_CLIENT_ID_VAR: &'static str = "GOOGLE_OAUTH_CLIENT_ID";
 
 /// State for Rocket to maintain a read-only copy of the OAuth configuration.
-pub struct OAuthConfig {
-    pub client_id: String,
+pub struct OAuthConfigService {
+    client_id: String,
+}
+
+impl OAuthConfigService {
+    /// Create and initialize a service instance by loading values from environment variables.
+    ///
+    /// Specifically, loads the `GOOGLE_OAUTH_CLIENT_ID` environment variable, verifies that it is a
+    /// valid URI, and returns the initialized service.
+    pub fn from_env() -> Result<Self, Error> {
+        Ok(Self {
+            client_id: env::var(OAUTH_CLIENT_ID_VAR)
+                .map_err(|e| {
+                    anyhow!("Unable to get OAuth client ID from the environment, please set it using the {} environment variable: {}", OAUTH_CLIENT_ID_VAR, e)
+                })
+                // strip whitespace around the value
+                .map(|s| s.trim().to_string())
+                .and_then(|s| {
+                    // try parsing the contents as a URI; google's client ID is a URI
+                    let _ = Uri::parse::<Authority>(s.as_ref())
+                        .map_err(|e| {
+                            anyhow!("Unable to parse the OAuth client ID as a URI, please pass a legitimate Google OAuth client ID: {}", e)
+                        })?;
+                    Ok(s)
+                })?
+        })
+    }
+
+    /// Create and initialize a service by providing the OAuth client ID directly.
+    #[allow(unused)]
+    pub fn new<S: Into<String>>(oauth_client_id: S) -> Result<Self, Error> {
+        let client_id = oauth_client_id.into().trim().to_string();
+
+        if let Err(e) = Uri::parse::<Authority>(client_id.as_ref()) {
+            return Err(anyhow!("Unable to parse the OAuth client ID as a URI, please pass a legitimate Google OAuth client ID: {}", e));
+        }
+
+        Ok(Self { client_id })
+    }
+
+    pub fn client_id(&self) -> &str {
+        self.client_id.as_ref()
+    }
 }
 
 /// Response from www.googleapis.com/oauth2/v1/certs containing key IDs to PEM-encoded certificates.
