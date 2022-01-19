@@ -1,66 +1,41 @@
 use anyhow::Result;
-use josekit::jwk::Jwk;
 use rocket::tokio;
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 
-#[derive(Debug, Serialize)]
-struct JwkSerializer<'a> {
-    #[serde(rename = "kty")]
-    key_type: &'a str,
-    #[serde(rename = "use")]
-    key_use: &'a str,
-    #[serde(rename = "alg")]
-    algorithm: &'a str,
-    #[serde(rename = "crv")]
-    curve: &'a str,
-    #[serde(rename = "d")]
-    private_key: &'a str,
-    #[serde(rename = "x")]
-    public_key: &'a str,
-    #[serde(rename = "kid")]
-    key_id: Option<&'a str>,
-}
-
-#[derive(Debug, Deserialize)]
-struct JwkDeserializer {
-    #[serde(rename = "kty")]
-    key_type: String,
-    #[serde(rename = "use")]
-    key_use: String,
-    #[serde(rename = "alg")]
-    algorithm: String,
-    #[serde(rename = "crv")]
-    curve: String,
-    #[serde(rename = "d")]
-    private_key: String,
-    #[serde(rename = "x")]
-    public_key: String,
-    #[serde(rename = "kid")]
-    key_id: Option<String>,
-}
-
-impl From<JwkDeserializer> for Jwk {
-    fn from(payload: JwkDeserializer) -> Self {
-        let mut result = Jwk::new(payload.key_type.as_str());
-        result.set_key_use(payload.key_use);
-        result.set_algorithm(payload.algorithm);
-        result.set_curve(payload.curve);
-        result
-            .set_parameter("d", Some(payload.private_key.into()))
-            .unwrap();
-        result
-            .set_parameter("x", Some(payload.public_key.into()))
-            .unwrap();
-
-        if let Some(key_id) = payload.key_id {
-            result.set_key_id(key_id);
-        }
-
-        result
-    }
+#[derive(Debug, Default, Deserialize, Serialize)]
+struct Transparent {
+    #[serde(flatten)]
+    map: Map<String, Value>,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let source = {
+        let mut r = Transparent::default();
+        r.map.insert("kty".into(), "OKP".into());
+        r.map.insert("use".into(), "sig".into());
+        r.map.insert("alg".into(), "EdDSA".into());
+        r.map.insert("crv".into(), "Ed25519".into());
+        r.map.insert(
+            "d".into(),
+            "BoSEh29I4_3NHKQAJKFsWRErvz8yOzNBsLZ_WJvoduw".into(),
+        );
+        r.map.insert(
+            "x".into(),
+            "8jtrgTb-O67D5ru4xFlSK1PcPK6CX_Pa7xdADZZEDmg".into(),
+        );
+        r.map.insert("kid".into(), "my-key-v1".into());
+        r
+    };
+
+    let serialized_str = serde_json::to_string_pretty(&source).unwrap();
+
+    println!("Serialized: {}", serialized_str);
+
+    let deserialized: Transparent = serde_json::from_str(serialized_str.as_str()).unwrap();
+
+    println!("Deserialized: {:#?}", deserialized);
+
     Ok(())
 }
