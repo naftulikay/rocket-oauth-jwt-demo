@@ -1,5 +1,6 @@
 use josekit::jwk::alg::ed::{EdCurve, EdKeyPair};
 use josekit::jwk::{Jwk, KeyPair};
+use josekit::jws::alg::eddsa::{EddsaJwsSigner, EddsaJwsVerifier};
 use josekit::jws::{EdDSA, JwsHeader};
 use josekit::jwt::{self, JwtPayload};
 use rand::prelude::*;
@@ -106,10 +107,10 @@ fn main() {
     );
 
     // create a signer; we only sign with one key
-    let token_signer = EdDSA.signer_from_jwk(&jwk_pub_priv).unwrap();
+    let token_signer: EddsaJwsSigner = EdDSA.signer_from_jwk(&jwk_pub_priv).unwrap();
 
     // create header
-    let header = {
+    let header: JwsHeader = {
         let mut value = JwsHeader::new();
         value.set_key_id(jwk_pub.key_id().unwrap());
         value.set_algorithm(keypair.algorithm().unwrap());
@@ -141,11 +142,11 @@ fn main() {
     println!("JWT Token: {}", token);
 
     // verify token
-    let token_verifier = EdDSA.verifier_from_jwk(&jwk_pub).unwrap();
+    let token_verifier: EddsaJwsVerifier = EdDSA.verifier_from_jwk(&jwk_pub).unwrap();
 
     // verify the signed token; dynamically choose which verifier to use based on the header's key
     // id
-    let (_verified_claims, _verified_header) =
+    let (_verified_claims, _verified_header): (JwtPayload, JwsHeader) =
         jwt::decode_with_verifier_selector(token, |header| {
             if let Some(header_key_id) = header.key_id() {
                 // if the header's key id matches our key's key id, use that as the verifier
