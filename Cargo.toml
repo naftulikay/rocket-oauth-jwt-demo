@@ -9,9 +9,14 @@ edition = "2021"
 path = "src/examples/gen-key.rs"
 name = "gen-key"
 
+[[bin]]
+path = "src/examples/keyring.rs"
+name = "keyring"
+
 [dependencies]
 anyhow = "1"
 base64 = "0.13"
+dirs = "4"
 env_logger = "0.9"
 hex = "0.4"
 isahc = { version = "1", features = ["json"] }

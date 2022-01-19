@@ -1,10 +1,20 @@
+#[cfg(test)]
+mod tests;
+
 use anyhow::Error;
 use josekit::jwk::Jwk;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 pub struct JwkKeyring {
     file: PathBuf,
+    store: JwkKeyringStore,
+}
+
+#[derive(Debug)]
+struct JwkKeyringStore {
+    signing_key: String,
     keys: HashMap<String, Jwk>,
 }
 
@@ -20,6 +30,6 @@ impl JwkKeyring {
             value
         };
 
-        self.keys.insert(key.key_id().unwrap().into(), key);
+        self.store.keys.insert(key.key_id().unwrap().into(), key);
     }
 }
