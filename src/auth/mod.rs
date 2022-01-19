@@ -1,4 +1,6 @@
-use crate::models::JwtToken;
+pub(crate) mod keyring;
+
+pub(crate) use crate::models::JwtToken;
 use josekit::JoseError;
 
 pub struct JwtIssuer {}
